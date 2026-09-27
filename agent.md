@@ -38,6 +38,7 @@ pulse-metronome/
 ├── package.json              # Project scripts & metadata
 ├── README.md                 # Public documentation
 ├── CONTRIBUTION.md           # Human contributor guidelines
+├── CHANGELOG.md              # Version release history and migration notes
 └── agent.md                  # Autonomous agent instructions (this file)
 ```
 
@@ -106,6 +107,7 @@ python -m http.server 8000
 |---|---|
 | `Spacebar` | Start / Stop metronome |
 | `H` | Toggle collapsible sidebar cockpit |
+| `P` | Toggle Document Picture-in-Picture mini-player |
 | `Arrow Up` / `Arrow Down` | Increment / Decrement BPM by 1 |
 | `Shift` + `Arrow Up` / `Arrow Down` | Increment / Decrement BPM by 5 |
 | `T` | Tap tempo input |
