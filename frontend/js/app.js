@@ -44,6 +44,25 @@ document.addEventListener('DOMContentLoaded', () => {
   const floatingSidebarTab = document.getElementById('floating-sidebar-tab');
 
   let needleDirection = 1;
+  let pillHitTimeout = null;
+  let pendulumTimeout = null;
+  let strobeTimeout = null;
+  const tapTimes = [];
+
+  function clearVisualTimeouts() {
+    if (pillHitTimeout) {
+      clearTimeout(pillHitTimeout);
+      pillHitTimeout = null;
+    }
+    if (pendulumTimeout) {
+      clearTimeout(pendulumTimeout);
+      pendulumTimeout = null;
+    }
+    if (strobeTimeout) {
+      clearTimeout(strobeTimeout);
+      strobeTimeout = null;
+    }
+  }
 
   // Initialize PipManager
   const pipManager = window.PipManager ? new PipManager({
@@ -92,58 +111,80 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Audio-Synchronized Beat Indicator
-  engine.onBeat = (beatNumber, isAccent, audioTime, totalBeats) => {
-    if (!engine.audioCtx) return;
+  // Audio-Synchronized Beat Indicator (Driven by hardware-locked requestAnimationFrame queue)
+  engine.onBeat = (beatNumber, isAccent, audioTime, totalBeats, beatInfo = {}) => {
+    if (!engine.audioCtx || !engine.isPlaying) return;
 
-    const delayMs = Math.max(0, (audioTime - engine.audioCtx.currentTime) * 1000);
+    clearVisualTimeouts();
 
-    setTimeout(() => {
-      // 1. Highlight the active beat pill (1, 2, 3, 4)
-      const pills = beatTracker.querySelectorAll('.beat-pill');
-      pills.forEach(pill => {
-        const pillBeat = parseInt(pill.dataset.beat, 10);
-        if (pillBeat === beatNumber) {
-          pill.classList.add('hit');
-          setTimeout(() => pill.classList.remove('hit'), 150);
-        } else {
-          pill.classList.remove('hit');
-        }
-      });
+    const beatDurationMs = beatInfo.beatDurationMs || (engine.getSecondsPerBeat() * 1000);
+    const pillHoldMs = Math.min(150, Math.max(40, Math.round(beatDurationMs * 0.55)));
+    const pendulumReturnMs = Math.min(120, Math.max(35, Math.round(beatDurationMs * 0.45)));
+    const transitionMs = Math.min(95, Math.max(28, Math.round(beatDurationMs * 0.36)));
+    const strobeHoldMs = Math.min(90, Math.max(28, Math.round(beatDurationMs * 0.35)));
+    const isSecondaryAccent = Boolean(beatInfo.isSecondaryAccent);
 
-      // 2. Animate pendulum needle
-      needleDirection = -needleDirection;
-      const swingAngle = isAccent ? 24 * needleDirection : 16 * needleDirection;
-      pendulumNeedle.style.transform = `rotate(${swingAngle}deg) scale(${isAccent ? 1.15 : 1.0})`;
-      setTimeout(() => {
-        pendulumNeedle.style.transform = `rotate(${swingAngle * 0.3}deg) scale(1.0)`;
-      }, 120);
-
-      // 3. Screen Flash on accented downbeat
-      if (isAccent) {
-        strobe.classList.remove('flash-beat');
-        strobe.classList.add('flash-one');
-        setTimeout(() => strobe.classList.remove('flash-one'), 90);
+    // 1. Highlight the active beat pill
+    const pills = beatTracker.querySelectorAll('.beat-pill');
+    let activePill = null;
+    pills.forEach(pill => {
+      const pillBeat = parseInt(pill.dataset.beat, 10);
+      if (pillBeat === beatNumber) {
+        pill.classList.add('hit');
+        activePill = pill;
+      } else {
+        pill.classList.remove('hit');
       }
+    });
+    if (activePill) {
+      pillHitTimeout = setTimeout(() => {
+        activePill.classList.remove('hit');
+        pillHitTimeout = null;
+      }, pillHoldMs);
+    }
 
-      // 4. Subtle beat resonance on living water cinemagraph
-      if (waterCinemagraph) {
-        waterCinemagraph.pulseBeat(isAccent);
-      }
+    // 2. Animate pendulum needle with tempo-adaptive physics
+    needleDirection = -needleDirection;
+    const swingAngle = isAccent ? 24 * needleDirection : (isSecondaryAccent ? 20 * needleDirection : 16 * needleDirection);
+    const scaleVal = isAccent ? 1.15 : (isSecondaryAccent ? 1.07 : 1.0);
+    pendulumNeedle.style.transitionDuration = `${transitionMs}ms`;
+    pendulumNeedle.style.transform = `rotate(${swingAngle}deg) scale(${scaleVal})`;
+    pendulumTimeout = setTimeout(() => {
+      pendulumNeedle.style.transform = `rotate(${swingAngle * 0.3}deg) scale(1.0)`;
+      pendulumTimeout = null;
+    }, pendulumReturnMs);
 
-      // 5. Sync PiP Mini Player beat tracker
-      pipManager?.onBeat(beatNumber, isAccent);
-    }, delayMs);
+    // 3. Screen Flash on accented downbeat
+    if (isAccent) {
+      strobe.classList.remove('flash-beat');
+      strobe.classList.add('flash-one');
+      strobeTimeout = setTimeout(() => {
+        strobe.classList.remove('flash-one');
+        strobeTimeout = null;
+      }, strobeHoldMs);
+    } else {
+      strobe.classList.remove('flash-one', 'flash-beat');
+    }
+
+    // 4. Subtle beat resonance on living water cinemagraph
+    if (waterCinemagraph) {
+      waterCinemagraph.pulseBeat(isAccent || isSecondaryAccent);
+    }
+
+    // 5. Sync PiP Mini Player beat tracker
+    pipManager?.onBeat(beatNumber, isAccent, isSecondaryAccent, pillHoldMs);
   };
 
   // Play / Pause Toggle
   function togglePlay() {
     if (engine.isPlaying) {
       engine.stop();
+      clearVisualTimeouts();
       playBtn.classList.remove('playing');
       iconPlay.style.display = 'block';
       iconPause.style.display = 'none';
       pendulumNeedle.style.transform = 'rotate(0deg)';
+      strobe.classList.remove('flash-one', 'flash-beat');
       beatTracker.querySelectorAll('.beat-pill').forEach(p => p.classList.remove('hit'));
       pipManager?.updatePlayState(false);
     } else {
@@ -177,6 +218,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const [beatsStr, noteValStr] = sig.split('/');
       const beats = parseInt(beatsStr, 10);
       const noteValue = parseInt(noteValStr, 10) || 4;
+      clearVisualTimeouts();
       engine.setTimeSignature(beats, noteValue);
       renderBeatTracker(beats);
       pipManager?.updateTimeSignature(beats);
@@ -230,6 +272,28 @@ document.addEventListener('DOMContentLoaded', () => {
   sidebarCloseBtn?.addEventListener('click', () => toggleSidebar(true));
   floatingSidebarTab?.addEventListener('click', () => toggleSidebar(false));
 
+  // High-Precision Tap Tempo (KeyT)
+  function handleTapTempo() {
+    const now = performance.now();
+    if (tapTimes.length > 0 && now - tapTimes[tapTimes.length - 1] > 2500) {
+      tapTimes.length = 0;
+    }
+    tapTimes.push(now);
+    if (tapTimes.length > 6) {
+      tapTimes.shift();
+    }
+    if (tapTimes.length >= 2) {
+      let totalInterval = 0;
+      for (let i = 1; i < tapTimes.length; i++) {
+        totalInterval += (tapTimes[i] - tapTimes[i - 1]);
+      }
+      const avgIntervalMs = totalInterval / (tapTimes.length - 1);
+      if (avgIntervalMs > 0) {
+        setBpm(60000 / avgIntervalMs);
+      }
+    }
+  }
+
   // Global Keyboard Shortcuts
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT') return;
@@ -243,6 +307,9 @@ document.addEventListener('DOMContentLoaded', () => {
     } else if (e.code === 'KeyP') {
       e.preventDefault();
       pipManager?.toggle();
+    } else if (e.code === 'KeyT') {
+      e.preventDefault();
+      handleTapTempo();
     } else if (e.code === 'ArrowUp') {
       e.preventDefault();
       setBpm(engine.bpm + (e.shiftKey ? 5 : 1));

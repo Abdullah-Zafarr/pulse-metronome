@@ -24,6 +24,8 @@ class MetronomeAudioEngine {
     this.nextNoteTime = 0.0;
     this.lastPlayedBeat = null;
     this.scheduledBeats = [];
+    this.visualQueue = [];
+    this.visualRafId = null;
     this.clapBuffer = null;
 
     this.timerId = null;
@@ -31,7 +33,7 @@ class MetronomeAudioEngine {
     this.lookahead = 15.0; // scheduler interval (ms)
     this.scheduleAheadTime = 0.10; // lookahead window (seconds)
 
-    // Visual synchronization callback: (beatNumber, isAccent, audioTime, totalBeats)
+    // Visual synchronization callback: (beatNumber, isAccent, audioTime, totalBeats, beatInfo)
     this.onBeat = null;
 
     this.setupWorker();
@@ -58,6 +60,9 @@ class MetronomeAudioEngine {
       this.timerWorker.onmessage = (e) => {
         if (e.data === 'tick') {
           this.scheduler();
+          if (typeof document !== 'undefined' && document.hidden) {
+            this.flushVisualQueue();
+          }
         }
       };
     } catch (err) {
@@ -77,6 +82,7 @@ class MetronomeAudioEngine {
           this.scheduleAheadTime = 0.10;
           if (this.isPlaying) {
             this.scheduler();
+            this.startVisualLoop();
           }
         }
       });
@@ -271,6 +277,7 @@ class MetronomeAudioEngine {
       this.cancelBeatRecord(this.scheduledBeats[i]);
     }
     this.scheduledBeats = [];
+    this.visualQueue = [];
   }
 
   pruneAndGetLastPlayedBeat(now) {
@@ -305,6 +312,7 @@ class MetronomeAudioEngine {
       }
     }
     this.scheduledBeats = remaining;
+    this.visualQueue = this.visualQueue.filter(v => !v.record.cancelled);
 
     if (lastBeat) {
       this.currentBeatIndex = (lastBeat.beatIdx + 1) % this.beatsPerBar;
@@ -332,6 +340,7 @@ class MetronomeAudioEngine {
       }
     }
     this.scheduledBeats = remaining;
+    this.visualQueue = this.visualQueue.filter(v => !v.record.cancelled);
 
     this.currentBeatIndex = 0;
     if (lastBeat) {
@@ -363,6 +372,7 @@ class MetronomeAudioEngine {
 
     if (earliestFuture) {
       this.scheduledBeats = remaining;
+      this.visualQueue = this.visualQueue.filter(v => !v.record.cancelled);
       this.nextNoteTime = earliestFuture.time;
       this.currentBeatIndex = earliestFuture.beatIdx;
       this.scheduler();
@@ -398,6 +408,7 @@ class MetronomeAudioEngine {
 
       // Schedule Beat 1 immediately before starting worker ticks
       this.scheduler();
+      this.startVisualLoop();
 
       if (this.timerWorker) {
         this.timerWorker.postMessage('start');
@@ -428,6 +439,7 @@ class MetronomeAudioEngine {
     clearTimeout(this.timerId);
     this.timerId = null;
 
+    this.stopVisualLoop();
     this.clearScheduledBeats();
     this.lastPlayedBeat = null;
 
@@ -437,6 +449,53 @@ class MetronomeAudioEngine {
 
     if ('mediaSession' in navigator) {
       navigator.mediaSession.playbackState = 'paused';
+    }
+  }
+
+  startVisualLoop() {
+    if (this.visualRafId) {
+      cancelAnimationFrame(this.visualRafId);
+      this.visualRafId = null;
+    }
+    const tickVisuals = () => {
+      if (!this.isPlaying) {
+        this.visualRafId = null;
+        return;
+      }
+      this.flushVisualQueue();
+      this.visualRafId = requestAnimationFrame(tickVisuals);
+    };
+    this.visualRafId = requestAnimationFrame(tickVisuals);
+  }
+
+  stopVisualLoop() {
+    if (this.visualRafId) {
+      cancelAnimationFrame(this.visualRafId);
+      this.visualRafId = null;
+    }
+  }
+
+  flushVisualQueue() {
+    if (!this.audioCtx || !this.isPlaying || this.visualQueue.length === 0) return;
+    // DynamicsCompressorNode introduces a 6ms internal lookahead delay;
+    // firing visual updates when currentTime reaches (visualTime - 0.002) aligns VSync paint with acoustic output.
+    const now = this.audioCtx.currentTime;
+    while (this.visualQueue.length > 0 && this.visualQueue[0].visualTime <= now + 0.002) {
+      const item = this.visualQueue.shift();
+      if (item.record && !item.record.cancelled && this.onBeat) {
+        this.onBeat(
+          item.beatNumber,
+          item.isAccent,
+          item.audioTime,
+          item.totalBeats,
+          {
+            accentLevel: item.accentLevel,
+            isSecondaryAccent: item.accentLevel === 1,
+            beatDurationMs: this.getSecondsPerBeat() * 1000,
+            noteValue: this.noteValue
+          }
+        );
+      }
     }
   }
 
@@ -460,6 +519,7 @@ class MetronomeAudioEngine {
       clearTimeout(this.timerId);
       this.timerId = setTimeout(() => {
         this.scheduler();
+        this.flushVisualQueue();
       }, this.lookahead);
     }
   }
@@ -500,9 +560,17 @@ class MetronomeAudioEngine {
     };
     this.scheduledBeats.push(record);
 
-    if (this.onBeat) {
-      this.onBeat(beatNumber, isAccent, safeAudioTime, this.beatsPerBar);
-    }
+    // Compensate for 6ms DynamicsCompressorNode lookahead delay for visual synchronization
+    const compressorLookaheadSec = 0.006;
+    this.visualQueue.push({
+      visualTime: safeAudioTime + compressorLookaheadSec,
+      audioTime: safeAudioTime,
+      beatNumber,
+      isAccent,
+      accentLevel,
+      totalBeats: this.beatsPerBar,
+      record
+    });
   }
 
   synthesizeSound(time, accentLevel) {

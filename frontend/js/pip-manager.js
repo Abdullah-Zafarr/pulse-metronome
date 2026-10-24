@@ -443,20 +443,38 @@ class PipManager {
     }
   }
 
-  onBeat(beatNumber, isAccent) {
+  onBeat(beatNumber, isAccent, isSecondaryAccent = false, holdMs = 120) {
     if (!this.isOpen() || !this.pipBeatTracker) return;
 
+    if (this.pipHitTimeout) {
+      clearTimeout(this.pipHitTimeout);
+      this.pipHitTimeout = null;
+    }
+
     const pills = this.pipBeatTracker.querySelectorAll('.pip-beat-pill');
+    let activePill = null;
     pills.forEach((pill, idx) => {
       const isActive = idx === beatNumber - 1;
       pill.classList.toggle('active', isActive);
-      if (isActive && isAccent) {
-        pill.classList.add('accent-beat');
+      pill.classList.toggle('accent-beat', isActive && (isAccent || isSecondaryAccent));
+      if (isActive) {
+        activePill = pill;
       }
     });
+
+    if (activePill) {
+      this.pipHitTimeout = setTimeout(() => {
+        activePill.classList.remove('active');
+        this.pipHitTimeout = null;
+      }, holdMs);
+    }
   }
 
   clearBeatHighlight() {
+    if (this.pipHitTimeout) {
+      clearTimeout(this.pipHitTimeout);
+      this.pipHitTimeout = null;
+    }
     if (!this.pipBeatTracker) return;
     this.pipBeatTracker.querySelectorAll('.pip-beat-pill').forEach((pill) => {
       pill.classList.remove('active');
