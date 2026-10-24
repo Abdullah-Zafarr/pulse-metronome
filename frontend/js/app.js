@@ -174,8 +174,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const sig = btn.dataset.sig;
       sigHeroVal.textContent = sig.replace('/', ' / ');
-      const beats = parseInt(sig.split('/')[0], 10);
-      engine.setTimeSignature(beats);
+      const [beatsStr, noteValStr] = sig.split('/');
+      const beats = parseInt(beatsStr, 10);
+      const noteValue = parseInt(noteValStr, 10) || 4;
+      engine.setTimeSignature(beats, noteValue);
       renderBeatTracker(beats);
       pipManager?.updateTimeSignature(beats);
     });

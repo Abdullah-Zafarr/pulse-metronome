@@ -14,6 +14,7 @@ class MetronomeAudioEngine {
     // Metronome state
     this.bpm = 90;
     this.beatsPerBar = 4;
+    this.noteValue = 4; // 4 = quarter-note pulse, 8 = eighth-note pulse (e.g. 6/8)
     this.volume = 3.0; // 300% default boost
     this.soundType = 'click'; // 'click' | 'woodblock' | 'cowbell' | 'clap'
     this.isAccentEnabled = false;
@@ -23,6 +24,7 @@ class MetronomeAudioEngine {
     this.nextNoteTime = 0.0;
     this.lastPlayedBeat = null;
     this.scheduledBeats = [];
+    this.clapBuffer = null;
 
     this.timerId = null;
     this.timerWorker = null;
@@ -122,6 +124,9 @@ class MetronomeAudioEngine {
     this.compressor.connect(this.masterGain);
     this.masterGain.connect(this.audioCtx.destination);
 
+    // Pre-build deterministic clap noise buffer once (zero per-beat GC or random transient jitter)
+    this.clapBuffer = this.createClapBuffer(this.audioCtx);
+
     // 5. Connect to MediaStreamDestination and HTML Audio Carrier for Chrome Tab-Switch Auto-PiP
     try {
       this.mediaStreamDest = this.audioCtx.createMediaStreamDestination();
@@ -146,6 +151,30 @@ class MetronomeAudioEngine {
     return Promise.resolve();
   }
 
+  createClapBuffer(ctx) {
+    const bufferSize = Math.floor(ctx.sampleRate * 0.05);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+
+    // Deterministic xorshift32 PRNG so every clap transient is 100% sample-identical
+    let seed = 0x9E3779B9;
+    const impulseSamples = Math.max(8, Math.floor(ctx.sampleRate * 0.0015));
+    for (let i = 0; i < bufferSize; i++) {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      const rand = ((seed >>> 0) / 4294967295) * 2 - 1;
+      // Crisp deterministic initial transient burst followed by dense noise body
+      if (i < impulseSamples) {
+        const phase = (i / impulseSamples) * Math.PI * 4;
+        data[i] = Math.sin(phase) * 0.65 + rand * 0.35;
+      } else {
+        data[i] = rand;
+      }
+    }
+    return buffer;
+  }
+
   makeSaturationCurve(amount = 25) {
     const n = 44100;
     const curve = new Float32Array(n);
@@ -158,7 +187,7 @@ class MetronomeAudioEngine {
   }
 
   getSecondsPerBeat() {
-    return 60.0 / this.bpm;
+    return (60.0 / this.bpm) * (4 / this.noteValue);
   }
 
   setVolume(percent) {
@@ -179,8 +208,15 @@ class MetronomeAudioEngine {
     }
   }
 
-  setTimeSignature(beats) {
-    this.beatsPerBar = parseInt(beats, 10) || 4;
+  setTimeSignature(sigOrBeats, noteValue = 4) {
+    if (typeof sigOrBeats === 'string' && sigOrBeats.includes('/')) {
+      const parts = sigOrBeats.split('/');
+      this.beatsPerBar = parseInt(parts[0], 10) || 4;
+      this.noteValue = parseInt(parts[1], 10) || 4;
+    } else {
+      this.beatsPerBar = parseInt(sigOrBeats, 10) || 4;
+      this.noteValue = parseInt(noteValue, 10) || 4;
+    }
     this.currentBeatIndex = 0;
 
     if (this.isPlaying && this.audioCtx) {
@@ -339,7 +375,7 @@ class MetronomeAudioEngine {
         navigator.mediaSession.metadata = new MediaMetadata({
           title: 'Pulse Metronome',
           artist: `${this.bpm} BPM`,
-          album: `${this.beatsPerBar}/4 Time Signature`
+          album: `${this.beatsPerBar}/${this.noteValue} Time Signature`
         });
       } catch (e) {}
     }
@@ -436,17 +472,29 @@ class MetronomeAudioEngine {
 
   scheduleBeat(time, beatIdx) {
     const beatNumber = beatIdx + 1; // 1 to beatsPerBar
-    const isAccent = this.isAccentEnabled && (beatNumber === 1);
+    const isCompoundSixEight = (this.beatsPerBar === 6 && this.noteValue === 8);
+
+    // Accent level: 2 = Primary downbeat (Beat 1), 1 = Secondary compound pulse (Beat 4 in 6/8), 0 = Subdivision
+    let accentLevel = 0;
+    if (this.isAccentEnabled) {
+      if (beatNumber === 1) {
+        accentLevel = 2;
+      } else if (isCompoundSixEight && beatNumber === 4) {
+        accentLevel = 1;
+      }
+    }
+    const isAccent = accentLevel === 2;
 
     // Guarantee safeAudioTime is at least 2ms in the future so the 1ms linear attack ramp is never clipped
     const safeAudioTime = Math.max(time, this.audioCtx.currentTime + 0.002);
-    const nodes = this.synthesizeSound(safeAudioTime, isAccent);
+    const nodes = this.synthesizeSound(safeAudioTime, accentLevel);
 
     const record = {
       time: safeAudioTime,
       gridTime: time,
       beatIdx,
       beatNumber,
+      accentLevel,
       nodes,
       cancelled: false
     };
@@ -457,30 +505,32 @@ class MetronomeAudioEngine {
     }
   }
 
-  synthesizeSound(time, isAccent) {
+  synthesizeSound(time, accentLevel) {
     if (!this.audioCtx) return null;
     const ctx = this.audioCtx;
 
     switch (this.soundType) {
       case 'woodblock':
-        return this.synthWoodblock(ctx, time, isAccent);
+        return this.synthWoodblock(ctx, time, accentLevel);
       case 'cowbell':
-        return this.synthCowbell(ctx, time, isAccent);
+        return this.synthCowbell(ctx, time, accentLevel);
       case 'clap':
-        return this.synthClap(ctx, time, isAccent);
+        return this.synthClap(ctx, time, accentLevel);
       case 'click':
       default:
-        return this.synthClick(ctx, time, isAccent);
+        return this.synthClick(ctx, time, accentLevel);
     }
   }
 
   /**
    * 1. Click (High-Penetration Boss DB-90 Style)
    */
-  synthClick(ctx, time, isAccent) {
-    const freq = isAccent ? 3800 : 2700;
-    const gainLevel = isAccent ? 1.4 : 0.95;
-    const duration = isAccent ? 0.045 : 0.032;
+  synthClick(ctx, time, accentLevel) {
+    const isPrimary = accentLevel === 2;
+    const isSecondary = accentLevel === 1;
+    const freq = isPrimary ? 3800 : (isSecondary ? 3200 : 2700);
+    const gainLevel = isPrimary ? 1.4 : (isSecondary ? 1.15 : 0.95);
+    const duration = isPrimary ? 0.045 : (isSecondary ? 0.038 : 0.032);
 
     const osc1 = ctx.createOscillator();
     const osc2 = ctx.createOscillator();
@@ -515,9 +565,11 @@ class MetronomeAudioEngine {
   /**
    * 2. Woodblock (Tuned Resonant Hollow Block)
    */
-  synthWoodblock(ctx, time, isAccent) {
-    const freq = isAccent ? 2400 : 1800;
-    const gainVal = isAccent ? 1.3 : 0.9;
+  synthWoodblock(ctx, time, accentLevel) {
+    const isPrimary = accentLevel === 2;
+    const isSecondary = accentLevel === 1;
+    const freq = isPrimary ? 2400 : (isSecondary ? 2100 : 1800);
+    const gainVal = isPrimary ? 1.3 : (isSecondary ? 1.1 : 0.9);
     const dur = 0.04;
 
     const osc = ctx.createOscillator();
@@ -543,12 +595,14 @@ class MetronomeAudioEngine {
   /**
    * 3. Cowbell (Dense Detuned Metallic Clank)
    */
-  synthCowbell(ctx, time, isAccent) {
-    const f1 = isAccent ? 740 : 587;
-    const f2 = isAccent ? 1046 : 845;
-    const bpFreq = isAccent ? 950 : 800;
-    const gainVal = isAccent ? 1.2 : 0.85;
-    const dur = isAccent ? 0.065 : 0.05;
+  synthCowbell(ctx, time, accentLevel) {
+    const isPrimary = accentLevel === 2;
+    const isSecondary = accentLevel === 1;
+    const f1 = isPrimary ? 740 : (isSecondary ? 659 : 587);
+    const f2 = isPrimary ? 1046 : (isSecondary ? 932 : 845);
+    const bpFreq = isPrimary ? 950 : (isSecondary ? 875 : 800);
+    const gainVal = isPrimary ? 1.2 : (isSecondary ? 1.0 : 0.85);
+    const dur = isPrimary ? 0.065 : (isSecondary ? 0.058 : 0.05);
 
     const osc1 = ctx.createOscillator();
     const osc2 = ctx.createOscillator();
@@ -581,27 +635,26 @@ class MetronomeAudioEngine {
   }
 
   /**
-   * 4. Clap (Burst Noise Transient)
+   * 4. Clap (Deterministic Burst Noise Transient)
    */
-  synthClap(ctx, time, isAccent) {
-    const bufferSize = ctx.sampleRate * 0.05;
-    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) {
-      data[i] = Math.random() * 2 - 1;
+  synthClap(ctx, time, accentLevel) {
+    const isPrimary = accentLevel === 2;
+    const isSecondary = accentLevel === 1;
+    if (!this.clapBuffer) {
+      this.clapBuffer = this.createClapBuffer(ctx);
     }
 
     const noise = ctx.createBufferSource();
-    noise.buffer = buffer;
+    noise.buffer = this.clapBuffer;
 
     const filter = ctx.createBiquadFilter();
     filter.type = 'bandpass';
-    filter.frequency.setValueAtTime(isAccent ? 1400 : 1000, time);
+    filter.frequency.setValueAtTime(isPrimary ? 1400 : (isSecondary ? 1200 : 1000), time);
     filter.Q.value = 2.0;
 
     const env = ctx.createGain();
     const dur = 0.045;
-    const gainVal = isAccent ? 1.4 : 1.0;
+    const gainVal = isPrimary ? 1.4 : (isSecondary ? 1.2 : 1.0);
     env.gain.setValueAtTime(0.0001, time);
     env.gain.linearRampToValueAtTime(gainVal, time + 0.001);
     env.gain.exponentialRampToValueAtTime(0.0001, time + dur);
