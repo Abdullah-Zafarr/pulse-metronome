@@ -21,6 +21,7 @@ class MetronomeAudioEngine {
     this.isPlaying = false;
     this.currentBeatIndex = 0;
     this.nextNoteTime = 0.0;
+    this.lastPlayedBeat = null;
     this.scheduledBeats = [];
 
     this.timerId = null;
@@ -156,6 +157,10 @@ class MetronomeAudioEngine {
     return curve;
   }
 
+  getSecondsPerBeat() {
+    return 60.0 / this.bpm;
+  }
+
   setVolume(percent) {
     this.volume = percent / 100;
     if (this.masterGain && this.audioCtx) {
@@ -164,20 +169,41 @@ class MetronomeAudioEngine {
   }
 
   setBpm(newBpm) {
-    this.bpm = Math.max(30, Math.min(300, Number(newBpm) || 90));
+    const clamped = Math.max(30, Math.min(300, Number(newBpm) || 90));
+    if (clamped === this.bpm) return;
+    this.bpm = clamped;
+
+    if (this.isPlaying && this.audioCtx) {
+      this.rescheduleOnTempoChange();
+      this.updateMediaSessionMetadata();
+    }
   }
 
   setTimeSignature(beats) {
     this.beatsPerBar = parseInt(beats, 10) || 4;
     this.currentBeatIndex = 0;
+
+    if (this.isPlaying && this.audioCtx) {
+      this.rescheduleOnMeterChange();
+      this.updateMediaSessionMetadata();
+    }
   }
 
   setSoundType(sound) {
+    if (this.soundType === sound) return;
     this.soundType = sound;
+    if (this.isPlaying && this.audioCtx) {
+      this.reschedulePendingBeatsInPlace();
+    }
   }
 
   setAccentEnabled(enabled) {
-    this.isAccentEnabled = Boolean(enabled);
+    const boolVal = Boolean(enabled);
+    if (this.isAccentEnabled === boolVal) return;
+    this.isAccentEnabled = boolVal;
+    if (this.isPlaying && this.audioCtx) {
+      this.reschedulePendingBeatsInPlace();
+    }
   }
 
   cancelBeatRecord(record) {
@@ -211,6 +237,102 @@ class MetronomeAudioEngine {
     this.scheduledBeats = [];
   }
 
+  pruneAndGetLastPlayedBeat(now) {
+    const keep = [];
+    for (let i = 0; i < this.scheduledBeats.length; i++) {
+      const b = this.scheduledBeats[i];
+      if (b.cancelled) continue;
+      if (b.time <= now + 0.004) {
+        this.lastPlayedBeat = { time: b.gridTime || b.time, beatIdx: b.beatIdx };
+      }
+      if (b.time >= now - 0.25) {
+        keep.push(b);
+      }
+    }
+    this.scheduledBeats = keep;
+    return this.lastPlayedBeat;
+  }
+
+  rescheduleOnTempoChange() {
+    if (!this.audioCtx || !this.isPlaying) return;
+    const now = this.audioCtx.currentTime;
+    const lastBeat = this.pruneAndGetLastPlayedBeat(now);
+
+    // Cancel any future unplayed beats in the lookahead window
+    const remaining = [];
+    for (let i = 0; i < this.scheduledBeats.length; i++) {
+      const b = this.scheduledBeats[i];
+      if (b.time > now + 0.004) {
+        this.cancelBeatRecord(b);
+      } else {
+        remaining.push(b);
+      }
+    }
+    this.scheduledBeats = remaining;
+
+    if (lastBeat) {
+      this.currentBeatIndex = (lastBeat.beatIdx + 1) % this.beatsPerBar;
+      this.nextNoteTime = Math.max(now + 0.012, lastBeat.time + this.getSecondsPerBeat());
+    } else {
+      this.currentBeatIndex = 0;
+      this.nextNoteTime = Math.max(now + 0.012, this.nextNoteTime);
+    }
+
+    this.scheduler();
+  }
+
+  rescheduleOnMeterChange() {
+    if (!this.audioCtx || !this.isPlaying) return;
+    const now = this.audioCtx.currentTime;
+    const lastBeat = this.pruneAndGetLastPlayedBeat(now);
+
+    const remaining = [];
+    for (let i = 0; i < this.scheduledBeats.length; i++) {
+      const b = this.scheduledBeats[i];
+      if (b.time > now + 0.004) {
+        this.cancelBeatRecord(b);
+      } else {
+        remaining.push(b);
+      }
+    }
+    this.scheduledBeats = remaining;
+
+    this.currentBeatIndex = 0;
+    if (lastBeat) {
+      this.nextNoteTime = Math.max(now + 0.012, lastBeat.time + this.getSecondsPerBeat());
+    } else {
+      this.nextNoteTime = Math.max(now + 0.012, this.nextNoteTime);
+    }
+
+    this.scheduler();
+  }
+
+  reschedulePendingBeatsInPlace() {
+    if (!this.audioCtx || !this.isPlaying) return;
+    const now = this.audioCtx.currentTime;
+    let earliestFuture = null;
+    const remaining = [];
+
+    for (let i = 0; i < this.scheduledBeats.length; i++) {
+      const b = this.scheduledBeats[i];
+      if (!b.cancelled && b.time > now + 0.004) {
+        if (!earliestFuture || b.time < earliestFuture.time) {
+          earliestFuture = { time: b.time, beatIdx: b.beatIdx };
+        }
+        this.cancelBeatRecord(b);
+      } else if (!b.cancelled) {
+        remaining.push(b);
+      }
+    }
+
+    if (earliestFuture) {
+      this.scheduledBeats = remaining;
+      this.nextNoteTime = earliestFuture.time;
+      this.currentBeatIndex = earliestFuture.beatIdx;
+      this.scheduler();
+    }
+  }
+
   updateMediaSessionMetadata() {
     if ('mediaSession' in navigator) {
       try {
@@ -229,11 +351,13 @@ class MetronomeAudioEngine {
 
     this.isPlaying = true;
     this.currentBeatIndex = 0;
+    this.lastPlayedBeat = null;
     this.clearScheduledBeats();
 
     const beginPlayback = () => {
       if (!this.isPlaying || !this.audioCtx) return;
       this.currentBeatIndex = 0;
+      this.lastPlayedBeat = null;
       this.nextNoteTime = this.audioCtx.currentTime + 0.03;
 
       // Schedule Beat 1 immediately before starting worker ticks
@@ -269,6 +393,7 @@ class MetronomeAudioEngine {
     this.timerId = null;
 
     this.clearScheduledBeats();
+    this.lastPlayedBeat = null;
 
     if (this.audioCarrier) {
       this.audioCarrier.pause();
@@ -283,16 +408,7 @@ class MetronomeAudioEngine {
     if (!this.isPlaying || !this.audioCtx) return;
 
     const now = this.audioCtx.currentTime;
-
-    // Prune completed beats
-    const keep = [];
-    for (let i = 0; i < this.scheduledBeats.length; i++) {
-      const b = this.scheduledBeats[i];
-      if (!b.cancelled && b.time >= now - 0.25) {
-        keep.push(b);
-      }
-    }
-    this.scheduledBeats = keep;
+    this.pruneAndGetLastPlayedBeat(now);
 
     // If the clock fell significantly behind (e.g. OS sleep or prolonged freeze), resync cleanly
     if (this.nextNoteTime < now - 0.12) {
@@ -313,7 +429,7 @@ class MetronomeAudioEngine {
   }
 
   advanceBeat() {
-    const secondsPerBeat = 60.0 / this.bpm;
+    const secondsPerBeat = this.getSecondsPerBeat();
     this.nextNoteTime += secondsPerBeat;
     this.currentBeatIndex = (this.currentBeatIndex + 1) % this.beatsPerBar;
   }
